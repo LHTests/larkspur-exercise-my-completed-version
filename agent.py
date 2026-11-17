@@ -9,6 +9,8 @@ Where you edit:   grep -n '✏' agent.py   (six marks, one per place)
 Steps and gates:  https://anthropicpartnerbasecamp.bts.com/
 """
 from __future__ import annotations
+import json
+import os
 from typing import Any, Dict, List
 from support import (MODEL, SYSTEM_PROMPT, call_local, execute_tool, mcp_client,
                      new_session, next_available_day, record_tool_result,
@@ -16,13 +18,47 @@ from support import (MODEL, SYSTEM_PROMPT, call_local, execute_tool, mcp_client,
 
 MAX_TOOL_CALLS = 8  # Larkspur's own build capped the loop here; then a human takes over.
 
-TONE_ADDENDUM = ("Remain calm and professional with frustrated customers. "
+TONE_ADDENDUM = ("Remain calm and professional with frustrated customers. " \
+                    "Acknowledge the customer's frustration or anger"
+                    " in your own words in your response to the customer, "
+                    "in keeping with the tone before moving on. " \
+                    "Put empathy into the customer facing text."
                     "If a customer threatens legal action or becomes abusive, "
                     "immediately call escalate_to_human. "
                     "After escalation, stop routine booking actions and "
-                    "explain that a human agent will handle the case.")    #  Build 4, step 4.1, intelligence goal
-EXTRA_TOOLS: List[Dict[str, Any]] = []   # ✏️ Build 2, step 2.1: schemas for the tools you add
-LOCAL_TOOLS: Dict[str, Any] = {}         # ✏️ Build 2, step 2.1: the functions behind them
+                    "explain that a human agent will handle the case."
+                    "Response should include their escalation_id for reference.")    #  Build 4, step 4.1, intelligence goal
+EXTRA_TOOLS: List[Dict[str, Any]] = [     # ✏️ Build 2, step 2.1: schemas for the tools you add
+    {
+        "name": "cause_in_plain_words",
+        "description": (
+            "Translate a disruption cause_code into wording a customer can be told, "
+            "in English and Spanish. Call it when you need to explain why a flight was "
+            "delayed, cancelled or diverted, instead of describing the cause yourself. "
+            "cause_code comes from get_flight_status's result, not asked of the customer."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cause_code": {"type": "string", "enum": ["WX", "ATC", "MX", "CREW", "SEC"]},
+            },
+            "required": ["cause_code"],
+        },
+    },
+]
+def cause_in_plain_words(cause_code: str) -> Dict[str, Any]:
+    """Look up the customer-facing wording for a disruption cause code."""
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "americas")
+    with open(os.path.join(data_dir, "disruption_policy.json")) as fh:
+        policy = json.load(fh)
+    labels = policy["cause_labels_customer"].get(cause_code)
+    if labels is None:
+        return {"error": "unknown cause_code %r" % cause_code,
+                 "known_codes": sorted(policy["cause_labels_customer"])}
+    return {"cause_code": cause_code, **labels}
+
+
+LOCAL_TOOLS: Dict[str, Any] = {"cause_in_plain_words": cause_in_plain_words}  # ✏️ Build 2, step 2.1: the functions behind them
 
 
 def text_of(response) -> str:
@@ -64,8 +100,13 @@ def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏�
         {"role": "user", "content": f"PNR {pnr}, last name {last_name}. {message}"},
     ]
 
+    system = [
+        {"type": "text", "text": SYSTEM_PROMPT + TONE_ADDENDUM, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": runtime_preamble()},
+    ]
+
     response = client.messages.create(
-        model=MODEL, max_tokens=4096, system=runtime_preamble() + SYSTEM_PROMPT + TONE_ADDENDUM,
+        model=MODEL, max_tokens=4096, system=system,
         thinking={"type": "adaptive"}, tools=tools, messages=messages,
     )
 
@@ -73,8 +114,12 @@ def run_agent(pnr: str, last_name: str, message: str) -> str:            # ✏�
     while response.stop_reason == "tool_use" and turns < MAX_TOOL_CALLS:
         messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": tool_results(response)})
+        system = [
+            {"type": "text", "text": SYSTEM_PROMPT + TONE_ADDENDUM, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": runtime_preamble()},
+        ]
         response = client.messages.create(
-            model=MODEL, max_tokens=4096, system=runtime_preamble() + SYSTEM_PROMPT + TONE_ADDENDUM,
+            model=MODEL, max_tokens=4096, system=system,
             thinking={"type": "adaptive"}, tools=tools, messages=messages,
         )
         turns += 1
